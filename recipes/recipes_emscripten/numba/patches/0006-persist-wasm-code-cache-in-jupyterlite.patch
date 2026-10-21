@@ -1,206 +1,405 @@
-diff --git a/numba/core/caching.py b/numba/core/caching.py
-index 98cf1bc..bc9e34d 100644
---- a/numba/core/caching.py
-+++ b/numba/core/caching.py
-@@ -36,6 +36,13 @@ def _cache_log(msg, *args):
-         print(msg)
- 
- 
-+def _is_jupyterlite_drive_path(path):
-+    return (
-+        sys.platform == "emscripten"
-+        and Path(path).is_relative_to("/drive")
-+    )
-+
-+
- class _Cache(metaclass=ABCMeta):
- 
-     @property
-@@ -108,6 +115,13 @@ class _CacheLocator(metaclass=ABCMeta):
-     def ensure_cache_path(self):
-         path = self.get_cache_path()
-         os.makedirs(path, exist_ok=True)
-+        if _is_jupyterlite_drive_path(path):
-+            # JupyterLite's DriveFS is backed by the asynchronous Contents API.
-+            # tempfile.TemporaryFile() creates and immediately unlinks a file,
-+            # which DriveFS cannot represent as a synchronous POSIX operation.
-+            # Creating the directory above is sufficient; actual cache writes
-+            # will still report any permission or I/O errors.
-+            return
-         # Ensure the directory is writable by trying to write a temporary file
-         tempfile.TemporaryFile(dir=path).close()
- 
-@@ -166,8 +180,17 @@ class _SourceFileBackedLocatorMixin(object):
-     def get_source_stamp(self):
-         if getattr(sys, 'frozen', False):
--            st = os.stat(sys.executable)
-+            source_path = sys.executable
-         else:
--            st = os.stat(self._py_file)
-+            source_path = self._py_file
-+        st = os.stat(source_path)
-+        if sys.platform == "emscripten":
-+            # JupyterLite reconstructs packaged source files for each fresh
-+            # kernel, so their mtimes are not stable across browser sessions.
-+            # Hash the source itself to keep an unchanged function cache valid
-+            # while still invalidating it when its Python module changes.
-+            with open(source_path, "rb") as f:
-+                source_hash = hashlib.sha256(f.read()).hexdigest()
-+            return source_hash, st.st_size
-         # We use both timestamp and size as some filesystems only have second
-         # granularity.
-         return st.st_mtime, st.st_size
-@@ -641,6 +664,15 @@ class IndexDataCacheFile(object):
-         Open *filepath* for writing in a race condition-free way (hopefully).
-         uuid4 is used to try and avoid name collisions on a shared filesystem.
-         """
-+        if _is_jupyterlite_drive_path(filepath):
-+            # DriveFS cannot reliably implement the temporary-file + atomic
-+            # replace protocol below.  A JupyterLite kernel is the sole writer
-+            # of its Numba cache, so write the destination through the Contents
-+            # API directly instead.
-+            with open(filepath, "wb") as f:
-+                yield f
-+            return
-+
-         uid = uuid.uuid4().hex[:16]  # avoid long paths
-         tmpname = '%s.tmp.%s' % (filepath, uid)
-         try:
-diff --git a/numba/core/codegen.py b/numba/core/codegen.py
-index 76fcf39..1d52383 100644
---- a/numba/core/codegen.py
-+++ b/numba/core/codegen.py
-@@ -650,6 +650,12 @@ class CPUCodeLibrary(CodeLibrary):
-             str(self._codegen._create_empty_module(self.name)))
-         self._final_module.name = cgutils.normalize_ir_text(self.name)
-         self._shared_module = None
-+        if sys.platform == "emscripten":
-+            # Every WASM library is emitted and loaded as an independent side
-+            # module.  Retain each emitted object so a cached parent can
-+            # restore its complete dependency closure without re-emitting
-+            # helper bitcode through LLVM.
-+            self.enable_object_caching()
- 
-     def _optimize_functions(self, ll_module):
-         """
-@@ -946,16 +952,97 @@ class CPUCodeLibrary(CodeLibrary):
-         self._ensure_finalized()
-         data = (self._get_compiled_object(),
-                 self._get_module_for_linking().as_bitcode())
-+        if sys.platform == "emscripten":
-+            dependencies = self._serialize_wasm_linking_libraries()
-+            wasm_trace.log(
-+                "cache",
-+                f"saving {len(dependencies)} linking module(s) with "
-+                f"{self.name!r}",
-+            )
-+            return (self.name, 'object', data, dependencies)
-         return (self.name, 'object', data)
- 
-+    def _serialize_wasm_linking_libraries(self):
-+        """Serialize separately loaded WASM objects in dependency order."""
-+        states = []
-+        seen = {id(self)}
-+
-+        def visit(library):
-+            identity = id(library)
-+            if identity in seen:
-+                return
-+            seen.add(identity)
-+            for dependency in library._linking_libraries:
-+                visit(dependency)
-+            data = (
-+                library._get_compiled_object(),
-+                library._get_module_for_linking().as_bitcode(),
-+            )
-+            states.append((library.name, 'object', data))
-+
-+        for library in self._linking_libraries:
-+            visit(library)
-+        return tuple(states)
-+
-+    @classmethod
-+    def _restore_wasm_linking_libraries(cls, codegen, states):
-+        """Load cached dependency objects before their calling side module."""
-+        for state in states:
-+            name, kind, data = state
-+            if kind == 'bitcode':
-+                # Accept caches produced by the first WASM cache format.
-+                module_bitcode = data
-+            elif kind == 'object':
-+                _object_code, module_bitcode = data
-+            else:
-+                raise ValueError(
-+                    "WASM linking library must contain bitcode or object code"
-+                )
-+
-+            module = ll.parse_bitcode(module_bitcode)
-+            function_definitions = [
-+                function.name
-+                for function in module.functions
-+                if not function.is_declaration
-+            ]
-+            loaded_function = next(
-+                (
-+                    symbol
-+                    for symbol in function_definitions
-+                    if codegen._engine.is_symbol_defined(symbol)
-+                ),
-+                None,
-+            )
-+            if loaded_function is not None:
-+                wasm_trace.log(
-+                    "cache",
-+                    f"linking module {name!r} is already loaded "
-+                    f"({loaded_function!r} is present)",
-+                )
-+                continue
-+
-+            wasm_trace.log("cache", f"restoring linking module {name!r}")
-+            cls._unserialize(codegen, state)
-+
-     @classmethod
-     def _unserialize(cls, codegen, state):
--        name, kind, data = state
-+        if len(state) == 3:
-+            name, kind, data = state
-+            dependencies = ()
-+        elif len(state) == 4:
-+            name, kind, data, dependencies = state
-+        else:
-+            raise ValueError("invalid serialized code library")
-+
-+        if dependencies:
-+            cls._restore_wasm_linking_libraries(codegen, dependencies)
-+
-         self = codegen.create_library(name)
-         assert isinstance(self, cls)
-         if kind == 'bitcode':
-             # No need to re-run optimizations, just make the module ready
-             self._final_module = ll.parse_bitcode(data)
-+            self._final_module.name = cgutils.normalize_ir_text(name)
-             self._finalize_final_module()
-             return self
-         elif kind == 'object':
-diff --git a/numba/core/config.py b/numba/core/config.py
-index 3a2ddfc..64a2873 100644
---- a/numba/core/config.py
-+++ b/numba/core/config.py
-@@ -277,9 +277,14 @@ class _EnvReloader(object):
-         # Enable logging of cache operation
-         DEBUG_CACHE = _readenv("NUMBA_DEBUG_CACHE", int, DEBUG)
- 
--        # Redirect cache directory
--        # Contains path to the directory
--        CACHE_DIR = _readenv("NUMBA_CACHE_DIR", str, "")
-+        # Redirect cache directory.  JupyterLite mounts its persistent user
-+        # filesystem at /drive; retain the native default everywhere else.
-+        default_cache_dir = (
-+            "/drive/.cache/numba"
-+            if sys.platform == "emscripten" and os.path.isdir("/drive")
-+            else ""
-+        )
-+        CACHE_DIR = _readenv("NUMBA_CACHE_DIR", str, default_cache_dir)
- 
-         # Override default cache locators list including their order
-         # Comma separated list of locator class names,
+#!/usr/bin/env python3
+"""
+triaxial_stress_strain_compare_v01.py
+=====================================
+
+Compare EXPERIMENTAL triaxial results with a MODEL/simulation curve
+(e.g. a PLAXIS SoilTest output) and plot the standard curves:
+
+    (a) deviator stress q        vs axial strain eps_a
+    (b) volumetric strain eps_v  vs axial strain eps_a      (if provided)
+    (c) deviator stress q        vs mean effective stress p' (if provided)
+    (d) pore-water pressure u    vs axial strain eps_a      (if provided, e.g. CU tests)
+
+Input CSV format (one file per curve, header row required)
+----------------------------------------------------------
+    required : axial_strain_percent, deviator_stress_kPa
+    optional : volumetric_strain_percent, mean_effective_stress_kPa, pore_pressure_kPa
+
+Conventions (must match your data; the script does NOT convert them):
+    * compression positive for stresses and strains
+    * axial strain in %, stresses in kPa
+    * volumetric strain: positive = contraction (note: PLAXIS output uses
+      compression NEGATIVE; flip the sign of your data if needed)
+    * q = sigma1 - sigma3 ; p' = (sigma1' + 2*sigma3') / 3
+    * pore_pressure_kPa = excess pore-water pressure (about 0 in a drained test)
+
+Metrics are computed only when a model curve is given. They quantify the
+agreement between two curves; they are NOT a scientific validation of the
+constitutive model or of the test itself.
+
+Usage
+-----
+    python triaxial_stress_strain_compare_v01.py --exp exp.csv --model model.csv \
+        --tag sampleA --title "Drained triaxial test, sigma3 = 200 kPa"
+    python triaxial_stress_strain_compare_v01.py --exp exp.csv          # experiment only
+    python triaxial_stress_strain_compare_v01.py --demo                 # SYNTHETIC demo
+
+Requirements: Python >= 3.9, numpy, pandas, matplotlib
+    pip install numpy pandas matplotlib
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")  # file output only; no display needed
+import matplotlib.pyplot as plt  # noqa: E402
+
+SCRIPT_VERSION = "v01"
+
+COL_EA = "axial_strain_percent"
+COL_Q = "deviator_stress_kPa"
+COL_EV = "volumetric_strain_percent"
+COL_P = "mean_effective_stress_kPa"
+COL_U = "pore_pressure_kPa"
+REQUIRED = (COL_EA, COL_Q)
+OPTIONAL = (COL_EV, COL_P, COL_U)
+
+# colour-blind-safe pair (Okabe-Ito): experiment black, model vermillion
+C_EXP = "#000000"
+C_MODEL = "#D55E00"
+
+SYNTHETIC_NOTE = "SAMPLE / SYNTHETIC DATA - not a laboratory measurement"
+
+
+class DataError(ValueError):
+    """Raised for missing, malformed or physically inconsistent input data."""
+
+
+# --------------------------------------------------------------------------
+# Input handling
+# --------------------------------------------------------------------------
+def validate_curve(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Validate and clean one curve. Returns a new, sorted DataFrame."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in REQUIRED if c not in df.columns]
+    if missing:
+        raise DataError(
+            f"[{label}] missing required column(s): {missing}. "
+            f"Found: {list(df.columns)}"
+        )
+
+    keep = [c for c in REQUIRED + OPTIONAL if c in df.columns]
+    df = df[keep]
+    for c in keep:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Rows with non-finite required values are dropped (reported, never silent).
+    finite_req = np.isfinite(df[list(REQUIRED)].to_numpy(dtype=float)).all(axis=1)
+    n_bad = int((~finite_req).sum())
+    if n_bad:
+        warnings.warn(
+            f"[{label}] dropped {n_bad} row(s) with non-numeric/NaN/Inf "
+            f"required values."
+        )
+        df = df[finite_req]
+    if len(df) < 3:
+        raise DataError(f"[{label}] fewer than 3 valid data points ({len(df)}).")
+
+    if (df[COL_EA] < 0).any():
+        raise DataError(
+            f"[{label}] negative axial strain found; this script assumes "
+            f"compression-positive data with strain >= 0."
+        )
+
+    # Optional columns that are entirely empty are removed.
+    for c in OPTIONAL:
+        if c in df.columns and not np.isfinite(df[c].to_numpy(dtype=float)).any():
+            df = df.drop(columns=c)
+
+    if not df[COL_EA].is_monotonic_increasing:
+        warnings.warn(
+            f"[{label}] axial strain is not monotonically increasing; "
+            f"rows were sorted by axial strain."
+        )
+        df = df.sort_values(COL_EA, kind="stable")
+
+    return df.reset_index(drop=True)
+
+
+def load_curve(path: str | Path, label: str) -> pd.DataFrame:
+    p = Path(path)
+    if not p.is_file():
+        raise DataError(f"[{label}] file not found: {p}")
+    try:
+        raw = pd.read_csv(p)
+    except Exception as exc:  # malformed CSV
+        raise DataError(f"[{label}] cannot parse CSV '{p}': {exc}") from exc
+    return validate_curve(raw, label)
+
+
+# --------------------------------------------------------------------------
+# Metrics
+# --------------------------------------------------------------------------
+def _interp(model: pd.DataFrame, col: str, x: np.ndarray) -> np.ndarray | None:
+    """Interpolate model[col] on axial strain x. None if column unusable."""
+    if col not in model.columns:
+        return None
+    sub = model[[COL_EA, col]].dropna()
+    if len(sub) < 2:
+        return None
+    xs, idx = np.unique(sub[COL_EA].to_numpy(float), return_index=True)
+    ys = sub[col].to_numpy(float)[idx]
+    if len(xs) < 2:
+        return None
+    return np.interp(x, xs, ys)
+
+
+def r_squared(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """R2 = 1 - SS_res/SS_tot (same definition as used in REF-001).
+    Returns NaN if the true values are constant (SS_tot = 0)."""
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    return float("nan") if ss_tot == 0.0 else 1.0 - ss_res / ss_tot
+
+
+def compare_curves(exp: pd.DataFrame, model: pd.DataFrame) -> pd.DataFrame:
+    """Return metrics in long format: quantity, metric, value, unit.
+
+    The model is interpolated onto the experimental axial-strain points inside
+    the strain range covered by BOTH curves (no extrapolation).
+    """
+    lo = max(exp[COL_EA].min(), model[COL_EA].min())
+    hi = min(exp[COL_EA].max(), model[COL_EA].max())
+    mask = (exp[COL_EA] >= lo) & (exp[COL_EA] <= hi)
+    if int(mask.sum()) < 3:
+        raise DataError(
+            "experiment and model overlap in fewer than 3 axial-strain points "
+            f"(overlap range {lo:g}..{hi:g} %)."
+        )
+    x = exp.loc[mask, COL_EA].to_numpy(float)
+
+    rows: list[dict] = []
+    quantities = [
+        (COL_Q, "q", "kPa"),
+        (COL_EV, "eps_v", "%"),
+        (COL_P, "p_prime", "kPa"),
+        (COL_U, "u", "kPa"),
+    ]
+    for col, name, unit in quantities:
+        if col not in exp.columns:
+            continue
+        f = _interp(model, col, x)
+        if f is None:
+            continue
+        y = exp.loc[mask, col].to_numpy(float)
+        ok = np.isfinite(y) & np.isfinite(f)
+        if ok.sum() < 3:
+            continue
+        err = f[ok] - y[ok]
+        rows += [
+            {"quantity": name, "metric": "n_points", "value": int(ok.sum()), "unit": "-"},
+            {"quantity": name, "metric": "rmse", "value": float(np.sqrt(np.mean(err**2))), "unit": unit},
+            {"quantity": name, "metric": "mae", "value": float(np.mean(np.abs(err))), "unit": unit},
+            {"quantity": name, "metric": "r2", "value": r_squared(y[ok], f[ok]), "unit": "-"},
+        ]
+
+    # Peak deviator stress (full curves, not only the overlap)
+    i_e = int(exp[COL_Q].idxmax())
+    i_m = int(model[COL_Q].idxmax())
+    q_e, q_m = float(exp.loc[i_e, COL_Q]), float(model.loc[i_m, COL_Q])
+    rel = float("nan") if q_e == 0 else 100.0 * (q_m - q_e) / q_e
+    rows += [
+        {"quantity": "q_peak", "metric": "experiment", "value": q_e, "unit": "kPa"},
+        {"quantity": "q_peak", "metric": "model", "value": q_m, "unit": "kPa"},
+        {"quantity": "q_peak", "metric": "rel_diff_model_vs_exp", "value": rel, "unit": "%"},
+        {"quantity": "eps_a_at_q_peak", "metric": "experiment", "value": float(exp.loc[i_e, COL_EA]), "unit": "%"},
+        {"quantity": "eps_a_at_q_peak", "metric": "model", "value": float(model.loc[i_m, COL_EA]), "unit": "%"},
+        {"quantity": "overlap", "metric": "eps_a_min", "value": float(lo), "unit": "%"},
+        {"quantity": "overlap", "metric": "eps_a_max", "value": float(hi), "unit": "%"},
+    ]
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
+# Plotting
+# --------------------------------------------------------------------------
+def _has(df: pd.DataFrame | None, col: str) -> bool:
+    return df is not None and col in df.columns
+
+
+def plot_comparison(
+    exp: pd.DataFrame,
+    model: pd.DataFrame | None,
+    out_base: Path,
+    title: str,
+    formats: tuple[str, ...] = ("png", "pdf"),
+    synthetic: bool = False,
+    dpi: int = 300,
+) -> list[Path]:
+    """Create the multi-panel figure and save it. Returns written paths."""
+    panels: list[str] = ["q_ea"]
+    if _has(exp, COL_EV) or _has(model, COL_EV):
+        panels.append("ev_ea")
+    if (_has(exp, COL_P) and _has(exp, COL_Q)) or (_has(model, COL_P) and _has(model, COL_Q)):
+        panels.append("q_p")
+    if _has(exp, COL_U) or _has(model, COL_U):
+        panels.append("u_ea")
+
+    ncols = 2 if len(panels) > 1 else 1
+    nrows = math.ceil(len(panels) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.4 * ncols, 4.2 * nrows), squeeze=False)
+    flat = axes.ravel()
+
+    spec = {
+        "q_ea": (COL_EA, COL_Q, r"Axial strain $\varepsilon_a$ (%)", r"Deviator stress $q=\sigma_1-\sigma_3$ (kPa)", "(a)"),
+        "ev_ea": (COL_EA, COL_EV, r"Axial strain $\varepsilon_a$ (%)", r"Volumetric strain $\varepsilon_v$ (%) [contraction +]", "(b)"),
+        "q_p": (COL_P, COL_Q, r"Mean effective stress $p'$ (kPa)", r"Deviator stress $q$ (kPa)", "(c)"),
+        "u_ea": (COL_EA, COL_U, r"Axial strain $\varepsilon_a$ (%)", r"Excess pore-water pressure $u$ (kPa)", "(d)"),
+    }
+    for ax, key in zip(flat, panels):
+        xc, yc, xl, yl, tag = spec[key]
+        if _has(exp, xc) and _has(exp, yc):
+            d = exp[[xc, yc]].dropna()
+            ax.plot(d[xc], d[yc], "o", ms=3.5, mfc="none", mec=C_EXP, mew=0.8,
+                    ls="none", label="Experiment")
+        if model is not None and _has(model, xc) and _has(model, yc):
+            d = model[[xc, yc]].dropna()
+            ax.plot(d[xc], d[yc], "-", color=C_MODEL, lw=1.6, label="Model")
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+        ax.set_title(tag, loc="left", fontsize=10)
+        ax.grid(True, ls=":", lw=0.5, alpha=0.7)
+        ax.legend(frameon=False, fontsize=8)
+        if key == "ev_ea":
+            ax.axhline(0.0, color="0.5", lw=0.6)
+    for ax in flat[len(panels):]:
+        ax.set_visible(False)
+
+    fig.suptitle(title, fontsize=11)
+    if synthetic:
+        fig.text(0.5, 0.005, SYNTHETIC_NOTE, ha="center", va="bottom",
+                 fontsize=8, color="#B00020", fontweight="bold")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+
+    written: list[Path] = []
+    for ext in formats:
+        path = out_base.with_suffix("." + ext)
+        fig.savefig(path, dpi=dpi)
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
+# --------------------------------------------------------------------------
+# Synthetic demo data (illustrative only)
+# --------------------------------------------------------------------------
+def synthetic_demo_data(seed: int = 42, sigma3_kPa: float = 200.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """SAMPLE / SYNTHETIC data to demonstrate the workflow.
+
+    Neither curve is a measurement or the output of PLAXIS/HS. Both are
+    arbitrary hyperbolic-type curves; 'experiment' = curve + seeded noise.
+    p' = sigma3 + q/3 holds for a drained conventional triaxial compression
+    test with constant sigma3 and zero pore pressure.
+    """
+    rng = np.random.default_rng(seed)
+
+    def q_curve(e, a, q_ult):  # q = e / (a + e/q_ult), e in %
+        return e / (a + e / q_ult)
+
+    def ev_curve(e, c1, c2):  # arbitrary contraction-then-dilation shape
+        return c1 * e - c2 * e**2
+
+    e_exp = np.linspace(0.0, 20.0, 41)
+    e_mod = np.linspace(0.0, 20.0, 201)
+    q_exp = q_curve(e_exp, 0.010, 600.0) * (1.0 + rng.normal(0.0, 0.015, e_exp.size))
+    q_exp[0] = 0.0
+    ev_exp = ev_curve(e_exp, 0.90, 0.050) + rng.normal(0.0, 0.03, e_exp.size)
+    q_mod = q_curve(e_mod, 0.012, 620.0)
+    ev_mod = ev_curve(e_mod, 1.00, 0.055)
+
+    exp = pd.DataFrame({
+        COL_EA: e_exp, COL_Q: q_exp, COL_EV: ev_exp,
+        COL_P: sigma3_kPa + q_exp / 3.0,
+    })
+    mod = pd.DataFrame({
+        COL_EA: e_mod, COL_Q: q_mod, COL_EV: ev_mod,
+        COL_P: sigma3_kPa + q_mod / 3.0,
+    })
+    return exp, mod
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Compare experimental and model triaxial stress-strain curves.")
+    ap.add_argument("--exp", help="CSV with experimental curve")
+    ap.add_argument("--model", help="CSV with model/simulation curve (optional)")
+    ap.add_argument("--demo", action="store_true",
+                    help="use built-in SYNTHETIC sample data (cannot be combined with --exp/--model)")
+    ap.add_argument("--tag", default="sample", help="short test/sample identifier used in output names")
+    ap.add_argument("--title", default="Triaxial test: experiment vs model", help="figure title")
+    ap.add_argument("--fig-dir", default="figures", help="output folder for figures")
+    ap.add_argument("--metrics-dir", default="data/processed", help="output folder for the metrics CSV")
+    ap.add_argument("--formats", default="png,pdf", help="comma-separated: png,pdf,svg")
+    ap.add_argument("--version", default=SCRIPT_VERSION, help="version suffix for output files")
+    ap.add_argument("--overwrite", action="store_true", help="allow overwriting existing outputs")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.demo:
+            if args.exp or args.model:
+                raise DataError("--demo cannot be combined with --exp/--model.")
+            exp, model = synthetic_demo_data()
+            exp, model = validate_curve(exp, "demo-exp"), validate_curve(model, "demo-model")
+        else:
+            if not args.exp:
+                raise DataError("provide --exp <file.csv> (or use --demo).")
+            exp = load_curve(args.exp, "experiment")
+            model = load_curve(args.model, "model") if args.model else None
+
+        formats = tuple(f.strip().lower() for f in args.formats.split(",") if f.strip())
+        bad_fmt = [f for f in formats if f not in {"png", "pdf", "svg"}]
+        if bad_fmt or not formats:
+            raise DataError(f"unsupported/empty --formats: {args.formats!r} (use png,pdf,svg).")
+
+        fig_dir, met_dir = Path(args.fig_dir), Path(args.metrics_dir)
+        suffix = "synthetic-demo" if args.demo else args.tag
+        base = fig_dir / f"triaxial_stress-strain-comparison_{suffix}_{args.version}"
+        metrics_path = met_dir / f"triaxial_comparison-metrics_{suffix}_{args.version}.csv"
+
+        planned = [base.with_suffix("." + f) for f in formats]
+        if model is not None:
+            planned.append(metrics_path)
+        existing = [p for p in planned if p.exists()]
+        if existing and not args.overwrite:
+            raise DataError(
+                "refusing to overwrite existing file(s): "
+                + ", ".join(map(str, existing))
+                + ". Use a new --version/--tag or pass --overwrite."
+            )
+
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        written = plot_comparison(exp, model, base, args.title, formats, synthetic=args.demo)
+        if model is not None:
+            met_dir.mkdir(parents=True, exist_ok=True)
+            metrics = compare_curves(exp, model)
+            metrics.to_csv(metrics_path, index=False)
+            written.append(metrics_path)
+            print(metrics.to_string(index=False))
+    except DataError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print("Written:")
+    for p in written:
+        print("  ", p)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
